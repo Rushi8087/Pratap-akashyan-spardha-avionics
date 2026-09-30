@@ -1,0 +1,30 @@
+# Arduino / PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.clang_complete
+.gcc-flags.json
+
+# Build and binary outputs
+*.hex
+*.bin
+*.elf
+*.o
+*.a
+*.d
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# IDE & Editor caches
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Arduino IDE temporary build dirs
+build/
+*.tmp
