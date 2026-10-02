@@ -1,22 +1,16 @@
 /*
   ================================================================
-  FULL AVIONICS REFERENCE SYSTEM
-  Akashyan Spardha 2026 — Solid Fuel Rocketry Challenge
+  FULL AVIONICS REFERENCE SYSTEM - FLIGHT VERSION
+  Akashyan Spardha 2026 - Solid Fuel Rocketry Challenge
   Team: Pratap (Team Code: AYS26-D5FTA)
   ================================================================
+
+  Launch detected above LAUNCH_DETECT_ALT, servo fires once at apogee.
 
   Required libraries:
     - "Adafruit BMP280" (+ "Adafruit Unified Sensor")
     - "ESP32Servo"
     - "LoRa" by Sandeep Mistry
-
-  Pinout (matches the official spec — only use these if this runs
-  on its own separate board, not the competition-issued ESP32):
-    BMP280  SDA -> GPIO21      BMP280  SCL -> GPIO22
-    RA-02   MOSI -> GPIO23     RA-02   MISO -> GPIO19
-    RA-02   SCK -> GPIO18      RA-02   NSS  -> GPIO5
-    RA-02   RESET -> GPIO14    RA-02   DIO0 -> GPIO26
-    Servo   Signal -> GPIO27   (own separate battery)
 */
 
 #include <Wire.h>
@@ -38,7 +32,7 @@
 
 #define SERVO_PIN    27
 
-#define LORA_FREQUENCY 434.5E6   // per competition spec — confirm before dual-TX use
+#define LORA_FREQUENCY 434.5E6
 
 // ================== Servo angles ==================
 #define SERVO_LOCKED_ANGLE   0
@@ -52,23 +46,25 @@
 #define CANDIDATE_CONFIRM_COUNT 3
 #define DROP_CONFIRM_READINGS   3
 
+// ================== Noise filtering ==================
+#define GROUND_SAMPLES     50      // samples averaged for ground reference
+#define FILTER_ALPHA       0.25    // 0.1 = very smooth/slow, 0.5 = fast/noisy
+
+float filteredAlt = 0;
+
 // ================== Team / identification ==================
-// Team code is for YOUR reference only — printed to Serial for
-// identification during testing. It is NOT transmitted in the
-// packet (the packet field is 1 numeric byte, see note above).
 #define TEAM_CODE "AYS26-D5FTA"
 #define TEAM_NAME "Pratap"
 
 // ================== Telemetry packet format ==================
-// Matches Annexure II Section 10:
-//   Rocket ID  (1 byte)   <-- numeric, organizer-assigned at inspection
+//   Rocket ID  (1 byte)
 //   TYPE       (1 byte)  0x01 = altitude, 0x02 = apogee
-//   SEQ        (2 bytes) 16-bit sequence number
+//   SEQ        (2 bytes)
 //   ALTITUDE   (2 bytes) unsigned, 0.1 m units
-#define ROCKET_ID 0   // placeholder — replace with organizer-assigned NUMERIC ID at inspection
+#define ROCKET_ID 0   // replace with organizer-assigned numeric ID at inspection
 uint16_t seqNumber = 0;
 
-const unsigned long TELEMETRY_INTERVAL_MS = 500; // 2 packets/sec per spec
+const unsigned long TELEMETRY_INTERVAL_MS = 500;
 unsigned long lastTelemetrySend = 0;
 
 // ================== State ==================
@@ -82,9 +78,8 @@ float pendingCandidate = 0;
 int   pendingCount     = 0;
 int   dropCount        = 0;
 
-bool launched   = false;
-bool ejected    = false;
-bool apogeeSent = false;
+bool launched     = false;
+bool ejected      = false;
 bool firstReading = true;
 
 void setup() {
@@ -93,7 +88,6 @@ void setup() {
   Serial.println("=== Full Avionics Reference System ===");
   Serial.print("Team: "); Serial.print(TEAM_NAME);
   Serial.print(" | Code: "); Serial.println(TEAM_CODE);
-  Serial.println("(Rocket ID for packets is numeric — set after organizer assigns it)");
 
   // ---------- BMP280 ----------
   Wire.begin(BMP_SDA, BMP_SCL);
@@ -103,15 +97,16 @@ void setup() {
   }
   Serial.println("BMP280 OK.");
   bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                   Adafruit_BMP280::SAMPLING_X2,
-                   Adafruit_BMP280::SAMPLING_X16,
-                   Adafruit_BMP280::FILTER_X16,
-                   Adafruit_BMP280::STANDBY_MS_63);
+                  Adafruit_BMP280::SAMPLING_X2,
+                  Adafruit_BMP280::SAMPLING_X16,
+                  Adafruit_BMP280::FILTER_X4,
+                  Adafruit_BMP280::STANDBY_MS_63);
 
   // ---------- Servo ----------
-  ejectionServo.attach(SERVO_PIN);
+  ejectionServo.setPeriodHertz(50);
+  ejectionServo.attach(SERVO_PIN, 500, 2400);
   ejectionServo.write(SERVO_LOCKED_ANGLE);
-  Serial.println("Servo initialized — locked position.");
+  Serial.println("Servo initialized - locked position.");
 
   // ---------- LoRa ----------
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_NSS);
@@ -119,14 +114,23 @@ void setup() {
   if (LoRa.begin(LORA_FREQUENCY)) {
     Serial.println("LoRa OK.");
   } else {
-    Serial.println("LoRa FAILED — check wiring/antenna.");
+    Serial.println("LoRa FAILED - check wiring/antenna.");
   }
 
-  // ---------- Ground reference ----------
+  // ---------- Ground reference (keep rocket still!) ----------
   delay(2000);
-  groundAltitude  = bmp.readAltitude(SEA_LEVEL_HPA);
+  Serial.println("Calibrating ground reference, keep still...");
+  for (int i = 0; i < 20; i++) { bmp.readAltitude(SEA_LEVEL_HPA); delay(60); }
+
+  float sum = 0;
+  for (int i = 0; i < GROUND_SAMPLES; i++) {
+    sum += bmp.readAltitude(SEA_LEVEL_HPA);
+    delay(60);
+  }
+  groundAltitude  = sum / GROUND_SAMPLES;
   lastValidAlt    = groundAltitude;
   confirmedMaxAlt = groundAltitude;
+  filteredAlt     = groundAltitude;
   Serial.print("Ground altitude reference: ");
   Serial.print(groundAltitude);
   Serial.println(" m");
@@ -139,25 +143,28 @@ void loop() {
 
   // ---------- Glitch rejection ----------
   if (!firstReading && fabs(rawAltitude - lastValidAlt) > MAX_PLAUSIBLE_STEP) {
-    Serial.println("Glitch rejected — implausible jump, ignored.");
+    Serial.println("Glitch rejected - implausible jump, ignored.");
     delay(100);
     return;
   }
   firstReading = false;
 
-  float altAboveGround = rawAltitude - groundAltitude;
+  // ---------- Smoothing (exponential filter) ----------
+  filteredAlt = FILTER_ALPHA * rawAltitude + (1.0 - FILTER_ALPHA) * filteredAlt;
+
+  float altAboveGround = filteredAlt - groundAltitude;
 
   // ---------- Launch detection ----------
   if (!launched && altAboveGround > LAUNCH_DETECT_ALT) {
     launched = true;
-    Serial.println(">>> LAUNCH DETECTED (above 100 m) <<<");
+    Serial.println(">>> LAUNCH DETECTED <<<");
   }
 
   if (launched && !ejected) {
     // ---------- Candidate-confirmed max tracking ----------
-    if (rawAltitude > confirmedMaxAlt) {
-      if (pendingCount == 0 || fabs(rawAltitude - pendingCandidate) <= CANDIDATE_TOLERANCE) {
-        pendingCandidate = rawAltitude;
+    if (filteredAlt > confirmedMaxAlt) {
+      if (pendingCount == 0 || fabs(filteredAlt - pendingCandidate) <= CANDIDATE_TOLERANCE) {
+        pendingCandidate = filteredAlt;
         pendingCount++;
         if (pendingCount >= CANDIDATE_CONFIRM_COUNT) {
           confirmedMaxAlt = pendingCandidate;
@@ -167,7 +174,7 @@ void loop() {
           Serial.println(" m");
         }
       } else {
-        pendingCandidate = rawAltitude;
+        pendingCandidate = filteredAlt;
         pendingCount = 1;
       }
       dropCount = 0;
@@ -181,19 +188,18 @@ void loop() {
 
     // ---------- Fire ejection ----------
     if (dropCount >= DROP_CONFIRM_READINGS) {
-      Serial.println(">>> APOGEE CONFIRMED — FIRING EJECTION <<<");
+      Serial.println(">>> APOGEE CONFIRMED - FIRING EJECTION <<<");
       fireServo();
-      apogeeSent = false; // trigger repeated apogee packets below
     }
   }
 
-  // ---------- Telemetry transmission (own backup link) ----------
+  // ---------- Telemetry transmission ----------
   if (millis() - lastTelemetrySend > TELEMETRY_INTERVAL_MS) {
     lastTelemetrySend = millis();
     if (ejected) {
-      sendPacket(0x02, confirmedMaxAlt - groundAltitude); // apogee packet, repeated
+      sendPacket(0x02, confirmedMaxAlt - groundAltitude);
     } else {
-      sendPacket(0x01, altAboveGround); // normal altitude packet
+      sendPacket(0x01, altAboveGround);
     }
   }
 
@@ -211,7 +217,8 @@ void fireServo() {
 
 // Builds and sends a 6-byte packet: ID, TYPE, SEQ(2), ALTITUDE(2)
 void sendPacket(uint8_t type, float altitudeMeters) {
-  uint16_t altValue = (uint16_t)(altitudeMeters * 10.0); // 0.1 m units
+  if (altitudeMeters < 0) altitudeMeters = 0;   // avoid negative wrap-around
+  uint16_t altValue = (uint16_t)(altitudeMeters * 10.0);
   seqNumber++;
 
   uint8_t packet[6];
